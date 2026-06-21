@@ -1,19 +1,29 @@
 #!/usr/bin/env node
-import { loadConfig } from './config';
-import { DnsPod } from './dnspod';
-import { Esa } from './esa';
-import { mapRecord, recordKey, type PlannedRecord } from './mapping';
+import { loadDomain } from './config';
+import { recordIdentity, type MirRecord } from './mir';
+import { planRecord } from './planner';
+import { getProvider, isProviderId, PROVIDER_IDS, type ProviderId } from './providers/registry';
+import type { Provider, ProviderContext } from './providers/types';
 import { logger } from './logger';
 
 interface CliOptions {
+  from?: string;
+  to?: string;
   dryRun: boolean;
   help: boolean;
 }
 
 function parseArgs(argv: string[]): CliOptions {
   const opts: CliOptions = { dryRun: false, help: false };
-  for (const arg of argv) {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
     switch (arg) {
+      case '--from':
+        opts.from = argv[++i];
+        break;
+      case '--to':
+        opts.to = argv[++i];
+        break;
       case '--dry-run':
       case '-n':
         opts.dryRun = true;
@@ -23,7 +33,9 @@ function parseArgs(argv: string[]): CliOptions {
         opts.help = true;
         break;
       default:
-        logger.warn(`Unknown argument ignored: ${arg}`);
+        if (arg.startsWith('--from=')) opts.from = arg.slice('--from='.length);
+        else if (arg.startsWith('--to=')) opts.to = arg.slice('--to='.length);
+        else logger.warn(`Unknown argument ignored: ${arg}`);
     }
   }
   return opts;
@@ -31,27 +43,42 @@ function parseArgs(argv: string[]): CliOptions {
 
 function printHelp(): void {
   console.log(`
-dnspod-to-esa — import DNSPod DNS records into Aliyun ESA
+dns-migrate — copy DNS records between providers via a neutral intermediate model
 
 Usage:
-  pnpm import [--dry-run]
-  pnpm dry-run
-  node dist/index.js [options]
+  dns-migrate --from <provider> --to <provider> [--dry-run]
+  pnpm dev --from esa --to cloudflare --dry-run
+
+Providers:
+  ${PROVIDER_IDS.join(', ')}
 
 Options:
-  -n, --dry-run   Show what would be created without writing to ESA
-  -h, --help      Show this help
+  --from <provider>   Source provider to read records from
+  --to <provider>     Target provider to create records in
+  -n, --dry-run       Show what would be created without writing to the target
+  -h, --help          Show this help
 
-Configuration is read from .env (see .env.example).
+Configuration (credentials, zone) is read from .env (see .env.example).
+Only the providers referenced by --from/--to are validated.
 `);
 }
 
-function describe(plan: PlannedRecord): string {
+function describe(rec: MirRecord): string {
   const extras: string[] = [];
-  if (plan.data.priority !== undefined) extras.push(`prio=${plan.data.priority}`);
-  if (plan.proxied) extras.push('proxied');
+  if (rec.priority !== undefined) extras.push(`prio=${rec.priority}`);
+  if (rec.proxied) extras.push('proxied');
   const suffix = extras.length ? ` (${extras.join(', ')})` : '';
-  return `${plan.type.padEnd(7)} ${plan.recordName} -> ${plan.data.value} ttl=${plan.ttl}${suffix}`;
+  return `${rec.type.padEnd(7)} ${rec.host} -> ${rec.value} ttl=${rec.ttl}${suffix}`;
+}
+
+function resolveProviderId(role: string, value: string | undefined): ProviderId {
+  if (!value) {
+    throw new Error(`Missing --${role} <provider>. Expected one of: ${PROVIDER_IDS.join(', ')}`);
+  }
+  if (!isProviderId(value)) {
+    throw new Error(`Unknown ${role} provider "${value}". Expected one of: ${PROVIDER_IDS.join(', ')}`);
+  }
+  return value;
 }
 
 async function main(): Promise<number> {
@@ -61,65 +88,64 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  const config = loadConfig();
-  if (opts.dryRun) {
-    logger.info('Running in DRY-RUN mode — no records will be created in ESA.');
+  const fromId = resolveProviderId('from', opts.from);
+  const toId = resolveProviderId('to', opts.to);
+  if (fromId === toId) {
+    throw new Error(`--from and --to must differ (both are "${fromId}").`);
   }
-  logger.info(`Source domain (DNSPod): ${config.dnspod.domain}`);
 
-  const dnspod = new DnsPod(config.dnspod);
-  const esa = new Esa(config.esa);
+  const zone = loadDomain();
+  const ctx: ProviderContext = { zone };
 
-  // 1. Fetch source records.
-  const sourceRecords = await dnspod.listRecords(config.dnspod.domain);
-  logger.info(`Fetched ${sourceRecords.length} record(s) from DNSPod.`);
+  // Construct providers — each validates only its own slice of .env.
+  const source: Provider = getProvider(fromId);
+  const target: Provider = getProvider(toId);
 
-  // 2. Resolve the target ESA site.
-  const siteId =
-    config.esa.siteId ?? (await esa.resolveSiteId(config.esa.siteName));
-  logger.info(
-    `Target ESA site: ${config.esa.siteName} (siteId=${siteId})` +
-      (config.esa.siteId ? ' [from .env]' : ' [resolved]'),
-  );
+  if (opts.dryRun) {
+    logger.info('Running in DRY-RUN mode — no records will be created in the target.');
+  }
+  logger.info(`Migrating zone "${zone}": ${fromId} -> ${toId}`);
 
-  // 3. Snapshot existing ESA records for idempotency.
-  const existing = await esa.listRecords(siteId);
-  const existingKeys = new Set(existing.map((r) => recordKey(r.recordName, r.recordType)));
-  logger.info(`ESA site already has ${existing.length} record(s).`);
+  // 1. Pull source records as MIR.
+  const sourceRecords = await source.listRecords(ctx);
+  logger.info(`Fetched ${sourceRecords.length} record(s) from ${fromId}.`);
+
+  // 2. Snapshot existing target records for idempotency.
+  const existing = await target.listRecords(ctx);
+  const existingKeys = new Set(existing.map((r) => recordIdentity(r)));
+  logger.info(`Target ${toId} already has ${existing.length} record(s).`);
 
   const stats = { created: 0, skipped: 0, existed: 0, failed: 0 };
 
   for (const rec of sourceRecords) {
-    const result = mapRecord(rec, config.dnspod.domain, config.proxied);
-
-    if (!result.ok) {
-      logger.skip(`${rec.type} ${rec.name} — ${result.reason}`);
+    const decision = planRecord(rec, target.capabilities, ctx);
+    if (!decision.ok) {
+      logger.skip(`${rec.type} ${rec.host} — ${decision.reason}`);
       stats.skipped += 1;
       continue;
     }
 
-    const { plan } = result;
-    if (existingKeys.has(recordKey(plan.recordName, plan.type))) {
-      logger.skip(`${describe(plan)} — already exists in ESA`);
+    if (existingKeys.has(recordIdentity(rec))) {
+      logger.skip(`${describe(rec)} — already exists in ${toId}`);
       stats.existed += 1;
       continue;
     }
 
     if (opts.dryRun) {
-      logger.dryRun(`would create: ${describe(plan)}`);
+      logger.dryRun(`would create: ${describe(rec)}`);
       stats.created += 1;
       continue;
     }
 
     try {
-      const recordId = await esa.createRecord(siteId, plan);
-      logger.success(`created: ${describe(plan)} [recordId=${recordId}]`);
-      // Guard against duplicate names within the same DNSPod export.
-      existingKeys.add(recordKey(plan.recordName, plan.type));
+      const recordId = await target.createRecord(ctx, rec);
+      logger.success(`created: ${describe(rec)} [recordId=${recordId}]`);
+      // Guard against duplicate records within the same source export.
+      existingKeys.add(recordIdentity(rec));
       stats.created += 1;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      logger.error(`failed: ${describe(plan)} — ${msg}`);
+      logger.error(`failed: ${describe(rec)} — ${msg}`);
       stats.failed += 1;
     }
   }
