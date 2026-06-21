@@ -1,0 +1,39 @@
+{
+  "name": "dnspod-to-esa",
+  "version": "1.0.0",
+  "description": "Import DNSPod DNS records into Aliyun ESA (Edge Security Acceleration)",
+  "main": "dist/index.js",
+  "bin": {
+    "dnspod-to-esa": "dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "import": "tsx src/index.ts",
+    "dry-run": "tsx src/index.ts --dry-run"
+  },
+  "keywords": [
+    "dnspod",
+    "aliyun",
+    "esa",
+    "dns",
+    "migration"
+  ],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.17.1",
+  "dependencies": {
+    "@alicloud/esa20240910": "^3.2.0",
+    "@alicloud/openapi-client": "^0.4.15",
+    "@alicloud/tea-util": "^1.4.11",
+    "dotenv": "^17.4.2",
+    "tencentcloud-sdk-nodejs-dnspod": "^4.1.213"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "tsx": "^4.22.4",
+    "typescript": "^5.7.0"
+  }
+}
