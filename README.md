@@ -1,72 +1,75 @@
-# dnspod-to-esa
+# dns-migrate
 
-将 **DNSPod**（腾讯云）的 DNS 解析记录批量导入到 **阿里云 ESA**（边缘安全加速）。
+在任意 DNS 服务商之间**批量复制解析记录**。通过一个 provider 无关的中间记录模型 **MIR**（Middle Intermediate Record），把每个服务商抽象成可读可写的 `provider`，从而用 `--from <源> --to <目标>` 在它们之间任意搬运。
 
-- 解析 `.env` 读取双方凭证与目标站点
-- 自动按域名解析 ESA `siteId`（`.env` 显式配置可覆盖）
-- 幂等导入：先对比 ESA 现有记录，已存在（同名同类型）则跳过
-- 内置 `--dry-run` 模式：只读、打印导入计划，不写入 ESA
+已内置三个 provider：
 
-## 技术栈
+| id | 服务商 | 说明 |
+|----|--------|------|
+| `dnspod` | DNSPod（腾讯云） | 读 / 写 |
+| `esa` | 阿里云 ESA（边缘安全加速） | 读 / 写，A/AAAA 合并，支持代理 |
+| `cloudflare` | Cloudflare | 读 / 写，支持代理（橙云） |
 
-| 用途 | 包 |
-|------|-----|
-| DNSPod SDK | `tencentcloud-sdk-nodejs-dnspod` (v20210323) |
-| ESA SDK | `@alicloud/esa20240910` |
-| 阿里云通用客户端 | `@alicloud/openapi-client` / `@alicloud/tea-util` |
-| 配置 | `dotenv` |
-| 语言/运行 | TypeScript + tsx + tsc (CommonJS) |
+特性：
+
+- 配置 `.env` 后，`--from esa --to cloudflare` 即可迁移，任意两 provider 组合（N×N）经 MIR 解耦
+- **按需校验**：只校验被 `--from/--to` 引用的 provider 凭证，未用到的留空也能运行
+- 幂等导入：先快照目标已有记录，**同名同类型同值**才跳过（MX/SRV 再比 `priority`），故 MX/TXT/多 A 等同名多值记录不会漏迁；值经归一化（去尾点、主机名/IP 大小写、TXT 去包裹引号）跨 provider 对齐
+- `--dry-run`：只读、打印计划，不写入目标
+
+## 架构
+
+```
+源 provider.listRecords() ──► MIR[] ──► planner（按目标能力过滤）──► 目标 provider.createRecord(MIR)
+```
+
+- **MIR**：`{ host, type, value, ttl, priority?, proxied?, disabled? }`，`host` 用 `@` 表 apex
+- **职责拆分**：能力过滤（disabled / SOA / 根 NS / 目标不支持的类型）归 `planner`（通用）；类型映射、proxied、TTL 归各 provider（私有）。proxied 与 TTL 由**目标** provider 依自身 env 决定，与源无关
 
 ## 快速开始
 
 ```bash
 pnpm install
-cp .env.example .env   # 填入凭证
-pnpm dry-run           # 预演，不写入
-pnpm import            # 正式导入
+cp .env.example .env                              # 填入用到的 provider 凭证
+pnpm dev --from esa --to cloudflare --dry-run     # 预演
+pnpm dev --from esa --to cloudflare               # 正式迁移
 ```
+
+## 命令
+
+```bash
+pnpm dev --from <p> --to <p> [--dry-run]   # tsx 直接运行源码
+pnpm build                                 # tsc 编译到 dist/
+pnpm start --from <p> --to <p>             # 运行编译产物
+pnpm typecheck                             # 仅类型检查
+pnpm dev --help                            # 帮助
+```
+
+`<p>` 取值：`dnspod` | `esa` | `cloudflare`。`--from` 与 `--to` 必填且不能相同。
 
 ## 配置（.env）
 
 完整说明见 `.env.example`，关键项：
 
-| 变量 | 必填 | 说明 |
+| 变量 | 适用 | 说明 |
 |------|------|------|
-| `DNSPOD_SECRET_ID` / `DNSPOD_SECRET_KEY` | 是 | 腾讯云 API 密钥 |
-| `DNSPOD_DOMAIN` | 是 | 待导出的源域名，如 `example.com` |
-| `ALIBABA_CLOUD_ACCESS_KEY_ID` / `..._SECRET` | 是 | 阿里云 RAM 密钥 |
-| `ESA_REGION_ID` | 否 | 默认 `cn-hangzhou` |
-| `ESA_ENDPOINT` | 否 | 默认 `esa.<region>.aliyuncs.com` |
-| `ESA_SITE_ID` | 否 | 显式指定站点；留空则按 `ESA_SITE_NAME` 自动解析 |
-| `ESA_SITE_NAME` | 否 | 解析 siteId 用的站点名，默认等于 `DNSPOD_DOMAIN` |
-| `ESA_PROXIED` | 否 | A/AAAA/CNAME 是否走 ESA 边缘代理，默认 `false` |
+| `DOMAIN` | 全部 | 操作的 DNS 域名/zone（兼容旧 `DNSPOD_DOMAIN`） |
+| `DNSPOD_SECRET_ID` / `DNSPOD_SECRET_KEY` | dnspod | 腾讯云 API 密钥 |
+| `ALIBABA_CLOUD_ACCESS_KEY_ID` / `..._SECRET` | esa | 阿里云 RAM 密钥 |
+| `ESA_REGION_ID` / `ESA_ENDPOINT` | esa | 默认 `cn-hangzhou` / `esa.<region>.aliyuncs.com` |
+| `ESA_SITE_ID` / `ESA_SITE_NAME` | esa | 显式站点；留空则按 `DOMAIN` 自动解析 |
+| `ESA_PROXIED` | esa（作目标） | 代理 A/AAAA/CNAME，默认 `false` |
+| `CLOUDFLARE_API_TOKEN` | cloudflare | 作用域 Token（Zone : DNS : Edit） |
+| `CLOUDFLARE_ZONE_ID` | cloudflare | 可选，留空按 `DOMAIN` 解析 |
+| `CLOUDFLARE_PROXIED` | cloudflare（作目标） | 橙云代理，默认 `false` |
 
-## 命令
+## 记录类型与处理
 
-```bash
-pnpm dev [--dry-run]   # tsx 直接运行源码
-pnpm dry-run           # 预演（= dev --dry-run）
-pnpm import            # 正式导入（= dev）
-pnpm build             # tsc 编译到 dist/
-pnpm start             # 运行编译产物
-pnpm typecheck         # 仅类型检查
-node dist/index.js -h  # 帮助
-```
-
-## 记录类型映射
-
-| DNSPod 类型 | ESA 处理 |
-|-------------|----------|
-| `A` / `AAAA` | 合并为 ESA 的 `A/AAAA` 类型 |
-| `CNAME` | `CNAME`，`sourceType=Domain`，去除尾点 |
-| `MX` | `MX`，携带 `priority`，去除尾点 |
-| `TXT` | `TXT` |
-| `NS`（非根） | `NS`，去除尾点 |
-| `SOA` / 根 `NS` | 跳过（由服务商/ESA 管理） |
-| 已禁用记录 | 跳过 |
-| 其他类型（SRV/CAA/…） | 跳过并告警（脚手架暂不支持） |
-
-> 代理记录（`ESA_PROXIED=true`）仅对 A/AAAA、CNAME 生效，且 ESA 会将其 TTL 接管为系统值。
+- 支持类型：`A` `AAAA` `CNAME` `TXT` `MX` `NS` `CAA` `SRV`
+- ESA 将 A/AAAA 合并为 `A/AAAA`；本工具读 ESA 时按 value 是否含 `:` 还原为 A 或 AAAA
+- `CNAME` / `MX` / `NS` 写入前去除尾点；`MX` 携带 `priority`
+- 跳过：`SOA`、根 `NS`（由服务商管理）、源端已禁用记录、目标不支持的类型
+- 代理记录仅对 A/AAAA/CNAME 生效，且目标会把 TTL 接管为自动值（`1`）
 
 ## 退出码
 
@@ -77,10 +80,23 @@ node dist/index.js -h  # 帮助
 
 ```
 src/
-├── index.ts     # CLI 入口：参数解析、--dry-run、编排与统计
-├── config.ts    # .env 解析与校验
-├── dnspod.ts    # DNSPod 客户端：分页拉取记录
-├── esa.ts       # ESA 客户端：解析 siteId、列举、创建记录
-├── mapping.ts   # DNSPod → ESA 记录映射与跳过规则
-└── logger.ts    # 轻量分级日志
+├── index.ts            # CLI 入口：--from/--to/--dry-run 解析、编排与统计
+├── config.ts           # 共享 env 助手 + DOMAIN 解析
+├── mir.ts              # MIR 中间记录模型 + 名称归一化 + recordKey
+├── planner.ts          # provider 无关的记录过滤
+├── logger.ts           # 轻量分级日志
+└── providers/
+    ├── types.ts        # Provider 接口 + 能力声明 + 上下文
+    ├── registry.ts     # id → factory 映射
+    ├── dnspod.ts       # DNSPod provider（读/写）
+    ├── esa.ts          # ESA provider（读/写）
+    └── cloudflare.ts   # Cloudflare provider（读/写）
 ```
+
+## 扩展新 provider
+
+1. 在 `src/providers/` 新增 `xxx.ts`，实现 `Provider` 接口（`listRecords`→MIR、`createRecord`←MIR、`capabilities`）
+2. 在 `registry.ts` 的 `PROVIDER_IDS` 与 `FACTORIES` 注册
+3. 在 `.env.example` 补充其凭证变量
+
+无需改动 `index.ts` 或其它 provider。
